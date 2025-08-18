@@ -830,94 +830,96 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 
 	vms := &rid.vmStructs
 
-	// Ruby does not provide introspection data, hard code the struct field offsets. Some
-	// values can be fairly easily calculated from the struct definitions, but some are
-	// looked up by using gdb and getting the field offset directly from debug data.
-	vms.execution_context_struct.vm_stack = 0
-	vms.execution_context_struct.vm_stack_size = 8
-	vms.execution_context_struct.cfp = 16
+	if err := rid.calculateTypesFromDWARF(ef); err != nil {
+		// Ruby does not provide introspection data, hard code the struct field offsets. Some
+		// values can be fairly easily calculated from the struct definitions, but some are
+		// looked up by using gdb and getting the field offset directly from debug data.
+		vms.execution_context_struct.vm_stack = 0
+		vms.execution_context_struct.vm_stack_size = 8
+		vms.execution_context_struct.cfp = 16
 
-	vms.control_frame_struct.pc = 0
-	vms.control_frame_struct.iseq = 16
-	vms.control_frame_struct.ep = 32
-	switch {
-	case version < rubyVersion(2, 6, 0):
-		vms.control_frame_struct.size_of_control_frame_struct = 48
-	case version < rubyVersion(3, 1, 0):
-		// With Ruby 2.6 the field bp was added to rb_control_frame_t
-		// https://github.com/ruby/ruby/commit/ed935aa5be0e5e6b8d53c3e7d76a9ce395dfa18b
-		vms.control_frame_struct.size_of_control_frame_struct = 56
-	default:
-		// 3.1 adds new jit_return field at the end.
-		// https://github.com/ruby/ruby/commit/9d8cc01b758f9385bd4c806f3daff9719e07faa0
-		vms.control_frame_struct.size_of_control_frame_struct = 64
+		vms.control_frame_struct.pc = 0
+		vms.control_frame_struct.iseq = 16
+		vms.control_frame_struct.ep = 32
+		switch {
+		case version < rubyVersion(2, 6, 0):
+			vms.control_frame_struct.size_of_control_frame_struct = 48
+		case version < rubyVersion(3, 1, 0):
+			// With Ruby 2.6 the field bp was added to rb_control_frame_t
+			// https://github.com/ruby/ruby/commit/ed935aa5be0e5e6b8d53c3e7d76a9ce395dfa18b
+			vms.control_frame_struct.size_of_control_frame_struct = 56
+		default:
+			// 3.1 adds new jit_return field at the end.
+			// https://github.com/ruby/ruby/commit/9d8cc01b758f9385bd4c806f3daff9719e07faa0
+			vms.control_frame_struct.size_of_control_frame_struct = 64
+		}
+		vms.iseq_struct.body = 16
+
+		vms.iseq_constant_body.iseq_type = 0
+		vms.iseq_constant_body.size = 4
+		vms.iseq_constant_body.encoded = 8
+		vms.iseq_constant_body.location = 64
+		switch {
+		case version < rubyVersion(2, 6, 0):
+			vms.iseq_constant_body.insn_info_body = 112
+			vms.iseq_constant_body.insn_info_size = 200
+			vms.iseq_constant_body.succ_index_table = 144
+			vms.iseq_constant_body.size_of_iseq_constant_body = 288
+		case version < rubyVersion(3, 2, 0):
+			vms.iseq_constant_body.insn_info_body = 120
+			vms.iseq_constant_body.insn_info_size = 136
+			vms.iseq_constant_body.succ_index_table = 144
+			vms.iseq_constant_body.size_of_iseq_constant_body = 312
+		default:
+			vms.iseq_constant_body.insn_info_body = 112
+			vms.iseq_constant_body.insn_info_size = 128
+			vms.iseq_constant_body.succ_index_table = 136
+			vms.iseq_constant_body.size_of_iseq_constant_body = 320
+		}
+		vms.iseq_location_struct.pathobj = 0
+		vms.iseq_location_struct.base_label = 8
+
+		switch {
+		case version < rubyVersion(2, 6, 0):
+			vms.iseq_insn_info_entry.position = 0
+			vms.iseq_insn_info_entry.size_of_position = 4
+			vms.iseq_insn_info_entry.line_no = 4
+			vms.iseq_insn_info_entry.size_of_line_no = 4
+			vms.iseq_insn_info_entry.size_of_iseq_insn_info_entry = 12
+		case version < rubyVersion(3, 1, 0):
+			// The position field was removed from this struct with
+			// https://github.com/ruby/ruby/commit/295838e6eb1d063c64f7cde5bbbd13c7768908fd
+			vms.iseq_insn_info_entry.position = 0
+			vms.iseq_insn_info_entry.size_of_position = 0
+			vms.iseq_insn_info_entry.line_no = 0
+			vms.iseq_insn_info_entry.size_of_line_no = 4
+			vms.iseq_insn_info_entry.size_of_iseq_insn_info_entry = 8
+		default:
+			// https://github.com/ruby/ruby/commit/0a36cab1b53646062026c3181117fad73802baf4
+			vms.iseq_insn_info_entry.position = 0
+			vms.iseq_insn_info_entry.size_of_position = 0
+			vms.iseq_insn_info_entry.line_no = 0
+			vms.iseq_insn_info_entry.size_of_line_no = 4
+			vms.iseq_insn_info_entry.size_of_iseq_insn_info_entry = 12
+		}
+		if version < rubyVersion(3, 2, 0) {
+			vms.rstring_struct.as_ary = 16
+		} else {
+			vms.rstring_struct.as_ary = 24
+		}
+		vms.rstring_struct.as_heap_ptr = 24
+
+		vms.rarray_struct.as_ary = 16
+		vms.rarray_struct.as_heap_ptr = 32
+
+		vms.succ_index_table_struct.small_block_ranks = 8
+		vms.succ_index_table_struct.block_bits = 16
+		vms.succ_index_table_struct.succ_part = 48
+		vms.succ_index_table_struct.size_of_succ_dict_block = 80
+		vms.size_of_immediate_table = 54
+
+		vms.size_of_value = 8
 	}
-	vms.iseq_struct.body = 16
-
-	vms.iseq_constant_body.iseq_type = 0
-	vms.iseq_constant_body.size = 4
-	vms.iseq_constant_body.encoded = 8
-	vms.iseq_constant_body.location = 64
-	switch {
-	case version < rubyVersion(2, 6, 0):
-		vms.iseq_constant_body.insn_info_body = 112
-		vms.iseq_constant_body.insn_info_size = 200
-		vms.iseq_constant_body.succ_index_table = 144
-		vms.iseq_constant_body.size_of_iseq_constant_body = 288
-	case version < rubyVersion(3, 2, 0):
-		vms.iseq_constant_body.insn_info_body = 120
-		vms.iseq_constant_body.insn_info_size = 136
-		vms.iseq_constant_body.succ_index_table = 144
-		vms.iseq_constant_body.size_of_iseq_constant_body = 312
-	default:
-		vms.iseq_constant_body.insn_info_body = 112
-		vms.iseq_constant_body.insn_info_size = 128
-		vms.iseq_constant_body.succ_index_table = 136
-		vms.iseq_constant_body.size_of_iseq_constant_body = 320
-	}
-	vms.iseq_location_struct.pathobj = 0
-	vms.iseq_location_struct.base_label = 8
-
-	switch {
-	case version < rubyVersion(2, 6, 0):
-		vms.iseq_insn_info_entry.position = 0
-		vms.iseq_insn_info_entry.size_of_position = 4
-		vms.iseq_insn_info_entry.line_no = 4
-		vms.iseq_insn_info_entry.size_of_line_no = 4
-		vms.iseq_insn_info_entry.size_of_iseq_insn_info_entry = 12
-	case version < rubyVersion(3, 1, 0):
-		// The position field was removed from this struct with
-		// https://github.com/ruby/ruby/commit/295838e6eb1d063c64f7cde5bbbd13c7768908fd
-		vms.iseq_insn_info_entry.position = 0
-		vms.iseq_insn_info_entry.size_of_position = 0
-		vms.iseq_insn_info_entry.line_no = 0
-		vms.iseq_insn_info_entry.size_of_line_no = 4
-		vms.iseq_insn_info_entry.size_of_iseq_insn_info_entry = 8
-	default:
-		// https://github.com/ruby/ruby/commit/0a36cab1b53646062026c3181117fad73802baf4
-		vms.iseq_insn_info_entry.position = 0
-		vms.iseq_insn_info_entry.size_of_position = 0
-		vms.iseq_insn_info_entry.line_no = 0
-		vms.iseq_insn_info_entry.size_of_line_no = 4
-		vms.iseq_insn_info_entry.size_of_iseq_insn_info_entry = 12
-	}
-	if version < rubyVersion(3, 2, 0) {
-		vms.rstring_struct.as_ary = 16
-	} else {
-		vms.rstring_struct.as_ary = 24
-	}
-	vms.rstring_struct.as_heap_ptr = 24
-
-	vms.rarray_struct.as_ary = 16
-	vms.rarray_struct.as_heap_ptr = 32
-
-	vms.succ_index_table_struct.small_block_ranks = 8
-	vms.succ_index_table_struct.block_bits = 16
-	vms.succ_index_table_struct.succ_part = 48
-	vms.succ_index_table_struct.size_of_succ_dict_block = 80
-	vms.size_of_immediate_table = 54
-
-	vms.size_of_value = 8
 
 	if version >= rubyVersion(3, 0, 0) {
 		if runtime.GOARCH == "amd64" {
