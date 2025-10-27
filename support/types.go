@@ -52,6 +52,8 @@ const (
 
 const MaxFrameUnwinds = 0x80
 
+const UnwindInfoMaxEntries = 0x4000
+
 const (
 	MetricIDBeginCumulative = 0x62
 )
@@ -87,6 +89,7 @@ const (
 	TraceOriginUnknown  = 0x0
 	TraceOriginSampling = 0x1
 	TraceOriginOffCPU   = 0x2
+	TraceOriginUProbe   = 0x3
 )
 
 type ApmSpanID [8]byte
@@ -144,15 +147,6 @@ type SystemAnalysis struct {
 	Pid       uint32
 	Code      [128]uint8
 	Pad_cgo_0 [4]byte
-}
-type SystemConfig struct {
-	Inverse_pac_mask       uint64
-	Tpbase_offset          uint64
-	Task_stack_offset      uint32
-	Stack_ptregs_offset    uint32
-	Off_cpu_threshold      uint32
-	Drop_error_only_traces bool
-	Pad_cgo_0              [3]byte
 }
 type TSDInfo struct {
 	Offset     int16
@@ -252,6 +246,7 @@ type PerlProcInfo struct {
 }
 type PyProcInfo struct {
 	AutoTLSKeyAddr                 uint64
+	NoneStructAddr                 uint64
 	Version                        uint16
 	TsdInfo                        TSDInfo
 	PyThreadState_frame            uint8
@@ -270,6 +265,7 @@ type PyProcInfo struct {
 }
 type RubyProcInfo struct {
 	Version                      uint32
+	Current_ec_tpbase_tls_offset uint64
 	Current_ctx_ptr              uint64
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
@@ -316,7 +312,7 @@ const (
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
 	sizeof_PHPProcInfo    = 0x18
-	sizeof_RubyProcInfo   = 0x20
+	sizeof_RubyProcInfo   = 0x28
 )
 
 const (

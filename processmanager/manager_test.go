@@ -26,7 +26,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
-	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	tracertypes "go.opentelemetry.io/ebpf-profiler/tracer/types"
 	"go.opentelemetry.io/ebpf-profiler/util"
@@ -46,6 +45,14 @@ func (d *dummyProcess) PID() libpf.PID {
 
 func (d *dummyProcess) GetMachineData() process.MachineData {
 	return process.MachineData{}
+}
+
+func (d *dummyProcess) GetProcessMeta(_ process.MetaConfig) process.ProcessMeta {
+	return process.ProcessMeta{}
+}
+
+func (d *dummyProcess) GetExe() (string, error) {
+	return "", errors.New("not implemented")
 }
 
 func (d *dummyProcess) GetMappings() ([]process.Mapping, uint32, error) {
@@ -251,17 +258,6 @@ func (mockup *ebpfMapsMockup) CollectMetrics() []metrics.Metric     { return []m
 func (mockup *ebpfMapsMockup) SupportsGenericBatchOperations() bool { return false }
 func (mockup *ebpfMapsMockup) SupportsLPMTrieBatchOperations() bool { return false }
 
-type symbolReporterMockup struct{}
-
-func (s *symbolReporterMockup) ExecutableKnown(_ libpf.FileID) bool {
-	return true
-}
-
-func (s *symbolReporterMockup) ExecutableMetadata(_ *reporter.ExecutableMetadataArgs) {
-}
-
-var _ reporter.SymbolReporter = (*symbolReporterMockup)(nil)
-
 func TestNewMapping(t *testing.T) {
 	tests := map[string]struct {
 		// newMapping holds the arguments that are passed to NewMapping() in the test.
@@ -294,12 +290,11 @@ func TestNewMapping(t *testing.T) {
 			// so we replace the stack delta provider.
 			dummyProvider := dummyStackDeltaProvider{}
 			ebpfMockup := &ebpfMapsMockup{}
-			symRepMockup := &symbolReporterMockup{}
 
 			// For this test do not include interpreters.
 			noInterpreters, _ := tracertypes.Parse("")
 
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 
 			manager, err := New(ctx,
@@ -307,7 +302,8 @@ func TestNewMapping(t *testing.T) {
 				1*time.Second,
 				ebpfMockup,
 				NewMapFileIDMapper(),
-				symRepMockup,
+				nil,
+				nil,
 				&dummyProvider,
 				true,
 				libpf.Set[string]{})
@@ -480,19 +476,19 @@ func TestProcExit(t *testing.T) {
 			// so we replace the stack delta provider.
 			dummyProvider := dummyStackDeltaProvider{}
 			ebpfMockup := &ebpfMapsMockup{}
-			repMockup := &symbolReporterMockup{}
 
 			// For this test do not include interpreters.
 			noInterpreters, _ := tracertypes.Parse("")
 
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 
 			manager, err := New(ctx,
 				noInterpreters,
 				1*time.Second,
 				ebpfMockup,
 				NewMapFileIDMapper(),
-				repMockup,
+				nil,
+				nil,
 				&dummyProvider,
 				true,
 				libpf.Set[string]{})

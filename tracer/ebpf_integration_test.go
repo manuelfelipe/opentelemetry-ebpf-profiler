@@ -6,7 +6,6 @@
 package tracer_test
 
 import (
-	"context"
 	"math"
 	"runtime"
 	"sync"
@@ -21,7 +20,6 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
@@ -33,11 +31,6 @@ type mockIntervals struct{}
 func (mockIntervals) MonitorInterval() time.Duration    { return 1 * time.Second }
 func (mockIntervals) TracePollInterval() time.Duration  { return 250 * time.Millisecond }
 func (mockIntervals) PIDCleanupInterval() time.Duration { return 1 * time.Second }
-
-type mockReporter struct{}
-
-func (mockReporter) ExecutableKnown(_ libpf.FileID) bool                   { return true }
-func (mockReporter) ExecutableMetadata(_ *reporter.ExecutableMetadataArgs) {}
 
 // forceContextSwitch makes sure two Go threads are running concurrently
 // and that there will be a context switch between those two.
@@ -111,12 +104,11 @@ func generateMaxLengthTrace() host.Trace {
 }
 
 func TestTraceTransmissionAndParsing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	enabledTracers, _ := tracertypes.Parse("")
 	enabledTracers.Enable(tracertypes.PythonTracer)
 	tr, err := tracer.NewTracer(ctx, &tracer.Config{
-		Reporter:               &mockReporter{},
 		Intervals:              &mockIntervals{},
 		IncludeTracers:         enabledTracers,
 		FilterErrorFrames:      false,
@@ -239,8 +231,7 @@ Loop:
 }
 
 func TestAllTracers(t *testing.T) {
-	_, err := tracer.NewTracer(context.Background(), &tracer.Config{
-		Reporter:               &mockReporter{},
+	_, err := tracer.NewTracer(t.Context(), &tracer.Config{
 		Intervals:              &mockIntervals{},
 		IncludeTracers:         tracertypes.AllTracers(),
 		SamplesPerSecond:       20,
@@ -248,6 +239,7 @@ func TestAllTracers(t *testing.T) {
 		ProbabilisticThreshold: 100,
 		OffCPUThreshold:        uint32(math.MaxUint32 / 100),
 		VerboseMode:            true,
+		LoadProbe:              true,
 	})
 	require.NoError(t, err)
 }

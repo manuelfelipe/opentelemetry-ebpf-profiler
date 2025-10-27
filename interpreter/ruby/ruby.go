@@ -23,9 +23,10 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/libpf/hash"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
+	npsr "go.opentelemetry.io/ebpf-profiler/nopanicslicereader"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/successfailurecounter"
 	"go.opentelemetry.io/ebpf-profiler/support"
@@ -87,6 +88,9 @@ type rubyData struct {
 	// currentCtxPtr is the `ruby_current_execution_context_ptr` symbol value which is needed by the
 	// eBPF program to build ruby backtraces.
 	currentCtxPtr libpf.Address
+
+	// Address to the ruby_current_ec variable in TLS, as an offset from tpbase
+	currentEcTpBaseTlsOffset libpf.Address
 
 	// version of the currently used Ruby interpreter.
 	// major*0x10000 + minor*0x100 + release (e.g. 3.0.1 -> 0x30001)
@@ -176,10 +180,18 @@ func rubyVersion(major, minor, release uint32) uint32 {
 
 func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address,
 	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
+
+	var tlsOffset uint64
+	if r.currentEcTpBaseTlsOffset != 0 {
+		// Read TLS offset from the TLS descriptor.
+		tlsOffset = rm.Uint64(bias + r.currentEcTpBaseTlsOffset + 8)
+	}
+
 	cdata := support.RubyProcInfo{
 		Version: r.version,
 
-		Current_ctx_ptr: uint64(r.currentCtxPtr + bias),
+		Current_ctx_ptr:              uint64(r.currentCtxPtr + bias),
+		Current_ec_tpbase_tls_offset: tlsOffset,
 
 		Vm_stack:      r.vmStructs.execution_context_struct.vm_stack,
 		Vm_stack_size: r.vmStructs.execution_context_struct.vm_stack_size,
@@ -204,12 +216,6 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		return nil, err
 	}
 
-	iseqBodyPCToFunction, err := freelru.New[rubyIseqBodyPC, *rubyIseq](iseqCacheSize,
-		hashRubyIseqBodyPC)
-	if err != nil {
-		return nil, err
-	}
-
 	addrToString, err := freelru.New[libpf.Address, libpf.String](addrToStringSize,
 		libpf.Address.Hash32)
 	if err != nil {
@@ -217,10 +223,9 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	}
 
 	return &rubyInstance{
-		r:                    r,
-		rm:                   rm,
-		iseqBodyPCToFunction: iseqBodyPCToFunction,
-		addrToString:         addrToString,
+		r:            r,
+		rm:           rm,
+		addrToString: addrToString,
 		memPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, 512)
@@ -233,31 +238,6 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 func (r *rubyData) Unload(_ interpreter.EbpfHandler) {
 }
 
-// rubyIseqBodyPC holds a reported address to a iseq_constant_body and Ruby VM program counter
-// combination and is used as key in the cache.
-type rubyIseqBodyPC struct {
-	addr libpf.Address
-	pc   uint64
-}
-
-func hashRubyIseqBodyPC(iseq rubyIseqBodyPC) uint32 {
-	h := iseq.addr.Hash()
-	h ^= hash.Uint64(iseq.pc)
-	return uint32(h)
-}
-
-// rubyIseq stores information extracted from a iseq_constant_body struct.
-type rubyIseq struct {
-	// sourceFileName is the extracted filename field
-	sourceFileName libpf.String
-
-	// functionName is the function name for this sequence
-	functionName libpf.String
-
-	// line of code in source file for this instruction sequence
-	line libpf.SourceLineno
-}
-
 type rubyInstance struct {
 	interpreter.InstanceStubs
 
@@ -267,10 +247,6 @@ type rubyInstance struct {
 
 	r  *rubyData
 	rm remotememory.RemoteMemory
-
-	// iseqBodyPCToFunction maps an address and Ruby VM program counter combination to extracted
-	// information from a Ruby instruction sequence object.
-	iseqBodyPCToFunction *freelru.LRU[rubyIseqBodyPC, *rubyIseq]
 
 	// addrToString maps an address to an extracted Ruby String from this address.
 	addrToString *freelru.LRU[libpf.Address, libpf.String]
@@ -325,21 +301,43 @@ func (r *rubyInstance) readPathObjRealPath(addr libpf.Address) (string, error) {
 	flags := r.rm.Ptr(addr)
 	switch flags & rubyTMask {
 	case rubyTString:
-		// nothing to do
+		return r.readRubyString(addr)
 	case rubyTArray:
-		var err error
-		addr, err = r.readRubyArrayDataPtr(addr)
-		if err != nil {
-			return "", err
+		vms := &r.r.vmStructs
+		arrData, e := r.readRubyArrayDataPtr(addr)
+		if e != nil {
+			return "", e
 		}
 
-		addr += pathObjRealPathIdx * libpf.Address(r.r.vmStructs.size_of_value)
-		addr = r.rm.Ptr(addr) // deref VALUE -> RString object
+		// Read contiguous pointer values into a buffer to be more efficient
+		dataBytes := make([]byte, 2 * vms.size_of_value)
+		if err := r.rm.Read(arrData, dataBytes); err != nil {
+			return "", fmt.Errorf("failed to read array data bytes: %v", err)
+		}
+
+		var relTag, absTag uint64
+		relVal := npsr.Ptr(dataBytes, 0)
+		absVal := npsr.Ptr(dataBytes, uint(vms.size_of_value))
+		if absVal != 0 {
+			absTag = uint64(r.rm.Ptr(absVal)) & uint64(rubyTMask)
+		}
+
+		var candidate libpf.Address
+		if absVal != 0 && absTag == uint64(rubyTString) {
+			candidate = absVal
+		} else if relVal != 0 {
+			relTag = uint64(r.rm.Ptr(relVal)) & uint64(rubyTMask)
+			if relTag == uint64(rubyTString) {
+				candidate = relVal
+			}
+		} else {
+			return "", fmt.Errorf("pathobj array has no string entries: relTag=0x%x absTag=0x%x", relTag, absTag)
+		}
+
+		return r.readRubyString(candidate)
 	default:
 		return "", fmt.Errorf("unexpected pathobj type tag: 0x%X", flags&rubyTMask)
 	}
-
-	return r.readRubyString(addr)
 }
 
 // readRubyString extracts a Ruby string from the given addr.
@@ -378,7 +376,8 @@ func (r *rubyInstance) getStringCached(addr libpf.Address, reader StringReader) 
 		return libpf.NullString, err
 	}
 	if !util.IsValidString(str) {
-		log.Debugf("Extracted invalid string from Ruby at 0x%x '%v'", addr, libpf.SliceFrom(str))
+		log.Debugf("Extracted invalid string from Ruby at 0x%x '%v'[len=%d]",
+			addr, unsafe.Slice(unsafe.StringData(str), min(len(str), 128)), len(str))
 		return libpf.NullString, fmt.Errorf("extracted invalid Ruby string from address 0x%x", addr)
 	}
 
@@ -644,58 +643,43 @@ func (r *rubyInstance) Symbolize(frame *host.Frame, frames *libpf.Frames) error 
 	// rb_iseq_constant_body
 	// https://github.com/ruby/ruby/blob/5445e0435260b449decf2ac16f9d09bae3cafe72/vm_core.h#L311
 	iseqBody := libpf.Address(frame.File)
+
 	// The Ruby VM program counter that was extracted from the current call frame is embedded in
 	// the Linenos field.
 	pc := frame.Lineno
 
-	key := rubyIseqBodyPC{
-		addr: iseqBody,
-		pc:   uint64(pc),
+	lineNo, err := r.getRubyLineNo(iseqBody, uint64(pc))
+	if err != nil {
+		return err
 	}
 
-	iseq, ok := r.iseqBodyPCToFunction.Get(key)
-	if !ok {
-		lineNo, err := r.getRubyLineNo(iseqBody, uint64(pc))
-		if err != nil {
-			return err
-		}
+	sourceFileNamePtr := r.rm.Ptr(iseqBody +
+		libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.pathobj))
+	sourceFileName, err := r.getStringCached(sourceFileNamePtr, r.readPathObjRealPath)
+	if err != nil {
+		return err
+	}
 
-		sourceFileNamePtr := r.rm.Ptr(iseqBody +
-			libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.pathobj))
-		sourceFileName, err := r.getStringCached(sourceFileNamePtr, r.readPathObjRealPath)
-		if err != nil {
-			return err
-		}
-
-		funcNamePtr := r.rm.Ptr(iseqBody +
-			libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.base_label))
-		functionName, err := r.getStringCached(funcNamePtr, r.readRubyString)
-		if err != nil {
-			return err
-		}
-
-		iseq = &rubyIseq{
-			functionName:   functionName,
-			sourceFileName: sourceFileName,
-			line:           libpf.SourceLineno(lineNo),
-		}
-		r.iseqBodyPCToFunction.Add(key, iseq)
+	funcNamePtr := r.rm.Ptr(iseqBody +
+		libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.base_label))
+	functionName, err := r.getStringCached(funcNamePtr, r.readRubyString)
+	if err != nil {
+		return err
 	}
 
 	// Ruby doesn't provide the information about the function offset for the
 	// particular line. So we report 0 for this to our backend.
 	frames.Append(&libpf.Frame{
 		Type:         libpf.RubyFrame,
-		FunctionName: iseq.functionName,
-		SourceFile:   iseq.sourceFileName,
-		SourceLine:   iseq.line,
+		FunctionName: functionName,
+		SourceFile:   sourceFileName,
+		SourceLine:   libpf.SourceLineno(lineNo),
 	})
 	sfCounter.ReportSuccess()
 	return nil
 }
 
 func (r *rubyInstance) GetAndResetMetrics() ([]metrics.Metric, error) {
-	rubyIseqBodyPCStats := r.iseqBodyPCToFunction.ResetMetrics()
 	addrToStringStats := r.addrToString.ResetMetrics()
 
 	return []metrics.Metric{
@@ -706,22 +690,6 @@ func (r *rubyInstance) GetAndResetMetrics() ([]metrics.Metric, error) {
 		{
 			ID:    metrics.IDRubySymbolizationFailure,
 			Value: metrics.MetricValue(r.failCount.Swap(0)),
-		},
-		{
-			ID:    metrics.IDRubyIseqBodyPCHit,
-			Value: metrics.MetricValue(rubyIseqBodyPCStats.Hits),
-		},
-		{
-			ID:    metrics.IDRubyIseqBodyPCMiss,
-			Value: metrics.MetricValue(rubyIseqBodyPCStats.Misses),
-		},
-		{
-			ID:    metrics.IDRubyIseqBodyPCAdd,
-			Value: metrics.MetricValue(rubyIseqBodyPCStats.Inserts),
-		},
-		{
-			ID:    metrics.IDRubyIseqBodyPCDel,
-			Value: metrics.MetricValue(rubyIseqBodyPCStats.Removals),
 		},
 		{
 			ID:    metrics.IDRubyAddrToStringHit,
@@ -754,7 +722,7 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 		return 0, fmt.Errorf("unable to read 'ruby_version': %v", err)
 	}
 
-	versionString := strings.TrimRight(unsafe.String(unsafe.SliceData(memory), len(memory)), "\x00")
+	versionString := strings.TrimRight(pfunsafe.ToString(memory), "\x00")
 	matches := rubyVersionRegex.FindStringSubmatch(versionString)
 	if len(matches) < 3 {
 		return 0, fmt.Errorf("failed to parse version string: '%s'", versionString)
@@ -784,16 +752,17 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Reason for lowest supported version:
 	// - Ruby 2.5 is still commonly used at time of writing this code.
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
-	// Reason for maximum supported version 3.2.x:
+	// Reason for maximum supported version 3.5.x:
 	// - this is currently the newest stable version
-
-	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(3, 3, 0)
+	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(3, 6, 0)
 	if version < minVer || version >= maxVer {
 		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and <= %d.%d.%d)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
 			(minVer>>16)&0xff, (minVer>>8)&0xff, minVer&0xff,
 			(maxVer>>16)&0xff, (maxVer>>8)&0xff, maxVer&0xff)
 	}
+
+	log.Debugf("Ruby %d.%d.%d detected", (version>>16)&0xff, (version>>8)&0xff, version&0xff)
 
 	// Before Ruby 2.5 the symbol ruby_current_thread was used for the current execution
 	// context but got replaced in [0] with ruby_current_execution_context_ptr.
@@ -806,26 +775,83 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	if version < rubyVersion(3, 0, 0) {
 		currentCtxSymbol = "ruby_current_execution_context_ptr"
 	}
-	currentCtxPtr, err := ef.LookupSymbolAddress(currentCtxSymbol)
-	if err != nil {
-		return nil, fmt.Errorf("%v not found: %v", currentCtxSymbol, err)
-	}
+
+	var currentEcTpBaseTlsOffset libpf.Address
+	var interpRanges []util.Range
 
 	// rb_vm_exec is used to execute the Ruby frames in the Ruby VM and is called within
 	// ruby_run_node  which is the main executor function since Ruby v1.9.0
 	// https://github.com/ruby/ruby/blob/587e6800086764a1b7c959976acef33e230dccc2/main.c#L47
-	symbolName := libpf.SymbolName("rb_vm_exec")
+	interpSymbolName := libpf.SymbolName("rb_vm_exec")
 	if version < rubyVersion(2, 6, 0) {
-		symbolName = libpf.SymbolName("ruby_exec_node")
-	}
-	interpRanges, err := info.GetSymbolAsRanges(symbolName)
-	if err != nil {
-		return nil, err
+		interpSymbolName = libpf.SymbolName("ruby_exec_node")
 	}
 
+	var rubyCurrentEcTlsSymbol = "ruby_current_ec"
+	var currentEcSymbolAddress libpf.SymbolValue
+
+	currentEcSymbolName := libpf.SymbolName(rubyCurrentEcTlsSymbol)
+
+	log.Debugf("Ruby %d.%d.%d detected, looking for currentCtxPtr=%q, currentEcSymbol=%q",
+		(version>>16)&0xff, (version>>8)&0xff, version&0xff, currentCtxSymbol, currentEcSymbolName)
+
+	// Symbol discovery strategy:
+	// - Ruby < 3.0.4: Uses currentCtxPtr (global/ractor-based execution context)
+	// - Ruby >= 3.0.4: Uses currentEcSymbol (TLS-based execution context via ruby_current_ec)
+	// When direct lookup fails, VisitSymbols scans all symbols as fallback.
+	// eBPF selects the appropriate method based on version at runtime.
+	currentCtxPtr, err := ef.LookupSymbolAddress(currentCtxSymbol)
+	if err != nil {
+		log.Debugf("Direct lookup of %v failed: %v, will try fallback", currentCtxSymbol, err)
+	}
+
+	interpRanges, err = info.GetSymbolAsRanges(interpSymbolName)
+	if err != nil {
+		log.Debugf("Direct lookup of %v failed: %v, will try fallback", interpSymbolName, err)
+	}
+
+	if err = ef.VisitSymbols(func(s libpf.Symbol) bool {
+		if s.Name == currentEcSymbolName {
+			currentEcSymbolAddress = s.Address
+		}
+		if s.Name == currentCtxSymbol {
+			currentCtxPtr = s.Address
+		}
+		if len(interpRanges) == 0 && s.Name == interpSymbolName {
+			interpRanges = []util.Range{{
+				Start: uint64(s.Address),
+				End:   uint64(s.Address) + s.Size,
+			}}
+		}
+		if len(interpRanges) > 0 && currentEcSymbolAddress != 0 && currentCtxPtr != 0 {
+			return false
+		}
+		return true
+	}); err != nil {
+		log.Warnf("failed to visit symbols: %v", err)
+	}
+
+	// NOTE for ruby 3.3.0+, if ruby is stripped, we have no way of locating
+	// ruby_current_ec TLS symbol.
+	// We could potentially add a fallback for this in the future, but for now
+	// only unstripped ruby is supported. Many distro supplied rubies are stripped.
+	if err = ef.VisitTLSRelocations(func(r pfelf.ElfReloc, symName string) bool {
+		if symName == rubyCurrentEcTlsSymbol ||
+			libpf.SymbolValue(r.Addend) == currentEcSymbolAddress {
+			currentEcTpBaseTlsOffset = libpf.Address(r.Off)
+			return false
+		}
+		return true
+	}); err != nil {
+		log.Warnf("failed to locate TLS descriptor: %v", err)
+	}
+
+	log.Debugf("Discovered EC tls tpbase offset %x, fallback ctx %x, interp ranges: %v", currentEcTpBaseTlsOffset, currentCtxPtr, interpRanges)
+
 	rid := &rubyData{
-		version:       version,
-		currentCtxPtr: libpf.Address(currentCtxPtr),
+		version:            version,
+		currentEcTpBaseTlsOffset:     libpf.Address(currentEcTpBaseTlsOffset),
+		currentCtxPtr:      libpf.Address(currentCtxPtr),
 	}
 
 	vms := &rid.vmStructs
@@ -847,10 +873,14 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		// With Ruby 2.6 the field bp was added to rb_control_frame_t
 		// https://github.com/ruby/ruby/commit/ed935aa5be0e5e6b8d53c3e7d76a9ce395dfa18b
 		vms.control_frame_struct.size_of_control_frame_struct = 56
-	default:
+	case version < rubyVersion(3, 3, 0):
 		// 3.1 adds new jit_return field at the end.
 		// https://github.com/ruby/ruby/commit/9d8cc01b758f9385bd4c806f3daff9719e07faa0
 		vms.control_frame_struct.size_of_control_frame_struct = 64
+	default:
+		// 3.3+ bp field was removed
+		// https://github.com/ruby/ruby/commit/f302e725e10ae05e613e2c24cae0741f65f2db91
+		vms.control_frame_struct.size_of_control_frame_struct = 56
 	}
 	vms.iseq_struct.body = 16
 
@@ -869,11 +899,21 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		vms.iseq_constant_body.insn_info_size = 136
 		vms.iseq_constant_body.succ_index_table = 144
 		vms.iseq_constant_body.size_of_iseq_constant_body = 312
-	default:
+	case version < rubyVersion(3, 3, 0):
 		vms.iseq_constant_body.insn_info_body = 112
 		vms.iseq_constant_body.insn_info_size = 128
 		vms.iseq_constant_body.succ_index_table = 136
 		vms.iseq_constant_body.size_of_iseq_constant_body = 320
+	case version >= rubyVersion(3, 4, 0) && version < rubyVersion(3, 5, 0):
+		vms.iseq_constant_body.insn_info_body = 112
+		vms.iseq_constant_body.insn_info_size = 128
+		vms.iseq_constant_body.succ_index_table = 136
+		vms.iseq_constant_body.size_of_iseq_constant_body = 352
+	default: // 3.3.x and 3.5.x have the same values
+		vms.iseq_constant_body.insn_info_body = 112
+		vms.iseq_constant_body.insn_info_size = 128
+		vms.iseq_constant_body.succ_index_table = 136
+		vms.iseq_constant_body.size_of_iseq_constant_body = 344
 	}
 	vms.iseq_location_struct.pathobj = 0
 	vms.iseq_location_struct.base_label = 8
@@ -920,10 +960,18 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	vms.size_of_value = 8
 
 	if version >= rubyVersion(3, 0, 0) {
-		if runtime.GOARCH == "amd64" {
-			vms.rb_ractor_struct.running_ec = 0x208
+		if version >= rubyVersion(3, 3, 0) {
+			if runtime.GOARCH == "amd64" {
+				vms.rb_ractor_struct.running_ec = 0x180
+			} else {
+				vms.rb_ractor_struct.running_ec = 0x190
+			}
 		} else {
-			vms.rb_ractor_struct.running_ec = 0x218
+			if runtime.GOARCH == "amd64" {
+				vms.rb_ractor_struct.running_ec = 0x208
+			} else {
+				vms.rb_ractor_struct.running_ec = 0x218
+			}
 		}
 	}
 
